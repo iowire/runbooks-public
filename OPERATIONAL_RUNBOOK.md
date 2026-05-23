@@ -388,6 +388,138 @@ monitoring spec's noise budget, no runbook = no alert.
 
 ---
 
+#### Alert S1C: Critical Async Queue Backup
+
+**Severity:** P1 · **Trigger:** staging `celery_queue_depth{queue="critical"} > 5` for 5+ min.
+
+**Redirect:** This is part of the staging async migration. Use [`async-task-staging-rollout.md`](../runbooks/async-task-staging-rollout.md) for rollout posture, rollback, and seven-day gates.
+
+**Triage:** Check the critical worker first, then money-adjacent tasks: payout, Stripe reconciliation, subscription reconciliation. If the critical queue is growing, stop any staging SQS primary/shadow experiment, leave `TASK_BACKEND=celery`, and restart only the affected staging worker after collecting `celery inspect active` and worker logs.
+
+---
+
+#### Alert S1R: Routed Async Queue Backup
+
+**Severity:** P2 · **Trigger:** staging `celery_queue_depth{queue=~"default|bulk|media"} > 100` for 15+ min.
+
+**Redirect:** This is part of the staging async migration. Use [`async-task-staging-rollout.md`](../runbooks/async-task-staging-rollout.md) for split-worker rollout and rollback steps.
+
+**Triage:** Identify `queue` from the alert, inspect the matching staging worker logs, and compare `task_publish_total` with `task_execution_total` by queue/backend. If only one routed queue is backed up, scale or restart that worker class instead of restarting every worker.
+
+---
+
+#### Alert ATE1: Async Task Publish Errors
+
+**Severity:** P1 · **Trigger:** staging `task_publish_total{result="error"}` for 5+ min.
+
+**Redirect:** Use [`async-task-staging-rollout.md`](../runbooks/async-task-staging-rollout.md), especially the preflight, SQS smoke, and rollback sections.
+
+**Triage:** Use alert labels `backend` and `queue`. For `backend="celery"`, verify Redis and Celery broker settings. For `backend="sqs"`, verify queue URL, IAM send permission, and AWS region. Keep primary task execution on Celery unless this is an explicitly approved staging cutover.
+
+---
+
+#### Alert ATE1S: Async Task Shadow Publish Errors
+
+**Severity:** P2 · **Trigger:** staging `task_publish_shadow_total{result="error"}` for 5+ min.
+
+**Redirect:** Use [`async-task-staging-rollout.md`](../runbooks/async-task-staging-rollout.md) for shadow queue topology. Shadow queues must stay separate from primary queues.
+
+**Triage:** Disable `TASK_PUBLISH_SHADOW` if errors are noisy, then verify `TASK_SHADOW_BACKEND=sqs`, `TASK_SHADOW_QUEUE_<CLASS>_URL`, and the dedicated shadow DLQ wiring. This is telemetry loss, not primary task loss, but it invalidates migration readiness.
+
+---
+
+#### Alert ATE2: Async Task Execution Errors
+
+**Severity:** P2 · **Trigger:** staging `task_execution_total{result=~"error|failure"}` for 5+ min.
+
+**Triage:** Use the async migration dashboard to break down by task/backend/queue, then trace the failing task in Sentry and worker logs using the correlation id. If `backend="sqs"`, stop the consumer before replaying messages and inspect the matching DLQ first.
+
+---
+
+#### Alert ATE3: Celery Worker Task Failures
+
+**Severity:** P2 · **Trigger:** staging `celery_task_events_total{result="failure"}` for 5+ min.
+
+**Triage:** Inspect the queue label, then check the staging worker logs and Sentry for the failing task name. This alert is queue-aggregated to avoid cardinality blowups; use dashboard task labels for drill-down, not alert fanout.
+
+---
+
+#### Alert ATE6: Async Metrics Collector Down
+
+**Severity:** P2 · **Trigger:** staging `metrics_collector_up{collector="redis_async"} == 0` for 5+ min.
+
+**Triage:** Treat migration dashboards as incomplete. Check app `/metrics`, Redis connectivity, and app logs for `metrics_export_failures_total` operations. Fix telemetry before using async metrics as a readiness gate.
+
+---
+
+#### Alert ATE7: Async Metrics Export Failures
+
+**Severity:** P2 · **Trigger:** staging `metrics_export_failures_total{operation!="none"}` increased in 10 min.
+
+**Triage:** Use labels `collector` and `operation`, then inspect app logs around the scrape. This catches partial metric loss while `/metrics` still returns 200; do not tune rollout gates from a partial scrape.
+
+---
+
+#### Alert ATE8: Tasking Metric Failures
+
+**Severity:** P2 · **Trigger:** staging `tasking_metric_failures_total{operation!="none"}` increased in 10 min.
+
+**Triage:** Check whether publish/execution counters failed to persist or render. SQS smoke readiness depends on these counters, so rerun the smoke only after the metric failure is fixed.
+
+---
+
+#### Alert ATE9: Celery Metric Write Failures
+
+**Severity:** P2 · **Trigger:** staging Loki log line `celery metric write failed kind=` appears.
+
+**Triage:** Search Loki or worker logs for the stable `kind=` value. Worker execution may be healthy while lifecycle, revocation, beat-depth, or execution metrics are missing; fix the write path before trusting Celery dashboards.
+
+---
+
+#### Alert ATE4: SQS Oldest Message Age
+
+**Severity:** P2 · **Trigger:** staging primary SQS oldest message age >5 min for 10+ min.
+
+**Redirect:** Use [`async-task-staging-rollout.md`](../runbooks/async-task-staging-rollout.md) for SQS smoke, delay limits, and rollback.
+
+**Triage:** Confirm whether the consumer is intentionally disabled. If not, check consumer logs, IAM receive/delete permissions, visibility timeout, and whether one poison message is repeatedly failing. Do not promote any primary SQS traffic while this alert is active.
+
+---
+
+#### Alert ATE5: SQS DLQ Messages
+
+**Severity:** P2 · **Trigger:** staging primary or shadow async DLQ visible messages >0 for 5+ min.
+
+**Redirect:** Use [`async-task-staging-rollout.md`](../runbooks/async-task-staging-rollout.md#dlq-inspection-and-replay) for the exact inspect/replay commands and Terraform-derived DLQ env setup.
+
+**Triage:** Inspect first, replay only after the failure mode is understood, and add `--delete` only after the replay target accepted the message. Never replay shadow DLQ messages into primary queues.
+
+---
+
+#### Alert S3: Celery Revocation Rate High
+
+**Severity:** P2 · **Trigger:** staging `rate(celery_task_revoked_total[15m]) > 0.2` for 30+ min.
+
+**Triage:** Find the dominant `task` in `celery_task_revoked_total`. A sustained revocation rate means tasks are expiring before workers can execute them, even if queue depth looks normal. Reduce the producing beat frequency, raise worker capacity, or pause the offending staging fan-out before it hides migration results.
+
+---
+
+#### Alert S4: Celery Beat Publish Depth Spike
+
+**Severity:** P2 · **Trigger:** staging `celery_beat_depth_at_publish > 200` for 15+ min.
+
+**Triage:** Use the `task` label to find which beat publish observed backlog. This is the leading indicator for S3 revocations; inspect beat logs, worker active tasks, and routed queue depth before changing schedules.
+
+---
+
+#### Alert S5: Celery Beat Schedule Missed
+
+**Severity:** P2 · **Trigger:** staging beat task age exceeds 3x its expected interval for 5+ min.
+
+**Triage:** Check `celery-beat` logs, then inspect worker scheduled and active tasks. If the task ran but did not update its Redis heartbeat, investigate task failure or heartbeat write failure before assuming the scheduler is dead.
+
+---
+
 #### Alert S2: DB Pool Near Exhaustion
 
 **Severity:** P1 · **Trigger:** `db_pool_checked_out / db_pool_size > 0.85` for 5+ min.
