@@ -62,12 +62,24 @@ ssh -i ~/code/tb_code/cert/standard-poc-key.pem ubuntu@standard.iowire.com
 ```
 
 **Database Access**:
+
+> **Security note:** Master DB password is fetched via SSM in a subshell;
+> never paste into a DSN string (lands in shell history + `/proc/<pid>/cmdline`,
+> visible to `ps`). The `( ... )` subshell scopes `PGPASSWORD` to the single
+> command — it does NOT leak into the parent shell or subsequent invocations.
+
 ```bash
-# Via Docker
+# Via Docker (no network DSN — password comes from the container env)
 docker exec -it <db-container> psql -U postgres -d standard_iowire
 
-# Direct connection (only reachable from the host — port 5432 is not security-group-open)
-psql postgresql://postgres:${DB_PASSWORD}@<DB-EIP>:5432/standard_iowire
+# Direct connection (only reachable from the host — port 5432 is not security-group-open).
+# PGPASSWORD lives only inside the subshell parens.
+( PGPASSWORD=$(AWS_PROFILE=standard aws ssm get-parameter \
+    --name /<env>/DB_PASSWORD \
+    --with-decryption \
+    --query Parameter.Value \
+    --output text) \
+  psql "postgresql://postgres@<DB-EIP>:5432/standard_iowire" )
 ```
 
 **Service Logs** (`docker compose -f docker-compose.yml ...` from `/opt/<app>`):
