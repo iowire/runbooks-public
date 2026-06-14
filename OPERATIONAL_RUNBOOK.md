@@ -1214,38 +1214,29 @@ When a Stripe dispute is opened (notification via Sentry or email):
 
 ### Updating Applications
 
-The canonical deploy path is **`scripts/promote.sh`** (unified deploy + health-gated auto-rollback). Manual `docker compose up -d` is a fallback ONLY when promote.sh is unavailable.
+Production is sign-off gated and ships ONLY an official release (a snapshot of a
+`main` revision already validated on staging). Do NOT `git pull` +
+`docker compose build` on the prod host: that bypasses sign-off, the version
+stamp, and `:previous` rollback tagging, and `promote.sh prod` now REQUIRES a
+release version. Full process: `docs/deployment/RELEASE_PROCESS.md`.
 
 ```bash
-# Preferred: end-to-end deploy via promote.sh (called from CI; can be invoked manually)
-cd /opt/<app>
-git pull origin main
-bash scripts/promote.sh prod
-# promote.sh handles: tag :previous, build, up -d, health-gate, auto-rollback on failure
+# 1. Merge to main (auto-validates on staging.iowire.com).
 
-# Rollback to the previous image if needed
-bash scripts/promote.sh rollback prod
+# 2. Cut a release from the staging-validated SHA (creates tag vYYYY.MM.DD):
+./scripts/promote.sh cut-release          # or the "Cut Release" GitHub workflow
+
+# 3. Deploy the release to prod (type the version to confirm):
+./scripts/promote.sh prod v2026.06.13     # or the "Deploy to Production" workflow
+
+# Rollback to the previous image (restores the :previous tag, health-gated):
+./scripts/promote.sh rollback prod
 ```
 
-**Manual fallback** (only if promote.sh is broken):
+**Emergency only** (audited, bypasses the release cut, requires explicit confirm):
 
 ```bash
-cd /opt/<app>
-git pull origin main
-
-# Tag current image as :previous so rollback has a target
-docker tag standard-app:latest standard-app:previous
-
-# Build new image (single Flask app — no portal/metrics/admin services)
-docker compose -f docker-compose.yml build app
-
-# Restart app, wait, health-check
-docker compose -f docker-compose.yml up -d --no-deps app
-sleep 30
-curl -f http://localhost:5000/health || echo "FAILED — consider rollback"
-
-# Restart Celery workers if task code changed
-docker compose -f docker-compose.yml up -d --no-deps celery-worker celery-beat
+scripts/break_glass_ship.sh --reason "<incident text>" --confirm
 ```
 
 For full deploy/rollback procedures see `docs/deployment/ROLLBACK_RUNBOOK.md`.

@@ -114,21 +114,16 @@ docker-compose up -d
 ## 🔄 Deployments
 
 ### Deploy Code Update
+Production is sign-off gated. Never `git pull` + build on the prod host by hand.
+Full process: `docs/deployment/RELEASE_PROCESS.md`.
 ```bash
-cd ~/code
-git pull origin main
-docker-compose build
-docker-compose up -d --no-deps <service_name>
-# Verify
-curl http://localhost:<port>/health
+./scripts/promote.sh cut-release          # cut vYYYY.MM.DD from staging-validated main
+./scripts/promote.sh prod v2026.06.13     # deploy the release (type the version to confirm)
 ```
 
 ### Rollback
 ```bash
-cd ~/code
-git revert HEAD
-docker-compose build
-docker-compose up -d
+./scripts/promote.sh rollback prod        # restore the previous image (health-gated)
 ```
 
 ---
