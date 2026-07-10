@@ -68,18 +68,24 @@ ssh -i ~/code/tb_code/cert/standard-poc-key.pem ubuntu@standard.iowire.com
 > visible to `ps`). The `( ... )` subshell scopes `PGPASSWORD` to the single
 > command — it does NOT leak into the parent shell or subsequent invocations.
 
-```bash
-# Via Docker (no network DSN — password comes from the container env)
-docker exec -it <db-container> psql -U postgres -d standard_iowire
+# Prod DB is the dedicated **RDS** `standard-prod-db` (no local `<db-container>`
+# container). The app connects as the NON-ROTATING owner role `standard_iowire_owner`
+# through pgbouncer; use that role for app-consistent access, NOT the auto-rotating
+# `postgres` master. The RDS is reachable ONLY from the prod EC2 box (SG-scoped), so
+# run these ON the box after `ssh ubuntu@standard.iowire.com` (confirm: `dig +short standard.iowire.com` = <DB-EIP>).
 
-# Direct connection (only reachable from the host — port 5432 is not security-group-open).
-# PGPASSWORD lives only inside the subshell parens.
+```bash
+# Easiest: reuse the app container's existing owner DATABASE_URL (through pgbouncer)
+docker compose -f docker-compose.yml -f docker-compose.production.yml \
+  exec app sh -lc 'psql "$DATABASE_URL"'
+
+# Direct to RDS as the owner role. PGPASSWORD lives only inside the subshell parens.
 ( PGPASSWORD=$(AWS_PROFILE=standard aws ssm get-parameter \
-    --name /<env>/DB_PASSWORD \
+    --name /<env>/RDS_OWNER_PASSWORD \
     --with-decryption \
     --query Parameter.Value \
     --output text) \
-  psql "postgresql://postgres@<DB-EIP>:5432/standard_iowire" )
+  psql "postgresql://standard_iowire_owner@standard-prod-db.c09gyk8iqz13.us-east-1.rds.amazonaws.com:5432/standard_iowire?sslmode=require" )
 ```
 
 **Service Logs** (`docker compose -f docker-compose.yml ...` from `/opt/<app>`):
