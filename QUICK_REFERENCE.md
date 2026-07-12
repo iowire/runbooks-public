@@ -221,7 +221,7 @@ docker exec -it <db-container> psql -U postgres -d standard_iowire -c \
 
 Production IPs exempt from rate limiting:
 - `127.0.0.1` / `::1` - Localhost (for internal health checks)
-- `98.87.212.123` - Production server (standard.iowire.com)
+- Production server IP — retired; see `.claude-shared/rules/production-safety.md` for the current value
 - `172.31.15.80` - Dev server (celtics.iowire.com)
 
 To add IPs: Set `RATE_LIMIT_WHITELIST_IPS` env var with comma-separated list.
@@ -236,7 +236,7 @@ To add IPs: Set `RATE_LIMIT_WHITELIST_IPS` env var with comma-separated list.
 ```bash
 dig standard.iowire.com
 
-# Should return: 98.87.212.123
+# Should return: the current prod IP — see .claude-shared/rules/production-safety.md (this doc's old value is retired)
 ```
 
 ### Check SSL Certificate
@@ -299,15 +299,7 @@ docker-compose restart caddy
 
 ## 📊 Test Credentials
 
-| Role | Email | Password |
-|------|-------|----------|
-| Admin | admin@iowire.com | TestPass123! |
-| Team | marcus@iowire.com | TestPass123! |
-| Client | luna@client.com | TestPass123! |
-| Reviewer | tiffy@standard.live | TestPass123! |
-| Artist | troy@test.com | TestPass123! |
-
-**⚠️ Change these in production!**
+> ⚠️ **LOCAL-DEV-ONLY.** This table is stale and duplicates a source of truth that has since diverged. Canonical: `docs/TEST_USERS.md` — its LOCAL-DEV-ONLY banner explains why the published password is not valid on any deployed target. Use that file, not this section.
 
 ---
 
