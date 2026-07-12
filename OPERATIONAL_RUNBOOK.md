@@ -377,7 +377,7 @@ monitoring spec's noise budget, no runbook = no alert.
 1. Cross-reference Sentry: <https://sentry.io/organizations/iowire/issues/?statsPeriod=15m&query=is%3Aunresolved> — group by exception type. The most common error in the last 15 min is the root cause candidate.
 2. Check container health: `docker compose -f /opt/<app>/docker-compose.yml ps` — any unhealthy/restarting? Recent OOM kill? `docker compose ... logs app --tail=200 | grep -iE "error|killed|oom"`.
 3. Check upstream dependencies in this order:
-   - **Database:** `docker compose ... exec db psql -U postgres -d iowire -c "SELECT count(*) FROM pg_stat_activity;"` (should be <80% of pool).
+   - **Database:** prod DB is dedicated RDS (`standard-prod-db`), reached through pgbouncer — reuse the app container's owner `DATABASE_URL` (see [Database Access](#access-information) above): `docker compose -f /opt/<app>/docker-compose.yml -f /opt/<app>/docker-compose.production.yml exec app sh -lc 'psql "$DATABASE_URL" -c "SELECT count(*) FROM pg_stat_activity;"'` (should be <80% of pool). Absolute `-f` paths so the command works from any directory post-SSH.
    - **Redis:** `docker compose ... exec redis redis-cli INFO replication` and `INFO memory`.
    - **Stripe:** check Stripe Dashboard → Developers → Logs for elevated 4xx/5xx rate from their side.
 4. If a deploy landed in the last hour, consider rollback: `cd /opt/<app> && bash scripts/promote.sh rollback`.
@@ -546,7 +546,7 @@ monitoring spec's noise budget, no runbook = no alert.
 
 **Triage (in order):**
 
-1. Identify long-running queries: `docker compose -f /opt/<app>/docker-compose.yml exec db psql -U postgres -d iowire -c "SELECT pid, age(clock_timestamp(), query_start) AS age, state, left(query, 100) AS query FROM pg_stat_activity WHERE state != 'idle' ORDER BY age DESC LIMIT 10;"`
+1. Identify long-running queries — prod DB is dedicated RDS (`standard-prod-db`) reached through pgbouncer, so run psql from the app container with its owner `DATABASE_URL` (see [Database Access](#access-information)): `docker compose -f /opt/<app>/docker-compose.yml -f /opt/<app>/docker-compose.production.yml exec app sh -lc 'psql "$DATABASE_URL" -c "SELECT pid, age(clock_timestamp(), query_start) AS age, state, left(query, 100) AS query FROM pg_stat_activity WHERE state != \$\$idle\$\$ ORDER BY age DESC LIMIT 10;"'` (`$$idle$$` is Postgres dollar-quoting — avoids nested single-quote escaping)
 2. Identify long-running transactions (held connection blocking pool return): same query but filter `WHERE state IN ('idle in transaction', 'idle in transaction (aborted)')`. Anything older than 60s is suspicious.
 3. Kill a stuck query if confirmed safe to abort: `SELECT pg_cancel_backend(<pid>);`. Avoid `pg_terminate_backend` unless cancel fails.
 4. Check pgbouncer side: `docker compose ... exec pgbouncer psql -h localhost -p 6432 -U postgres pgbouncer -c "SHOW POOLS;" -c "SHOW CLIENTS;"`.
