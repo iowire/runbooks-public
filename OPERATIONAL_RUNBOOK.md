@@ -426,6 +426,24 @@ monitoring spec's noise budget, no runbook = no alert.
 
 ---
 
+#### Alert S1M: Media Transcode Backlog
+
+**Severity:** P2 · **Trigger:** `celery_queue_depth{queue="media"} > 30` for 5+ min (prod-inclusive, per-host).
+
+**What it means:** The on-box Celery `media` queue is core audio transcode (ffmpeg 2-pass EBU-R128 loudnorm + `libmp3lame`). At the single-worker floor it drains ~2-3 uploads/min, so a sustained depth >30 is ~10+ minutes of backlog and growing. Artist **time-to-playable** is degrading and host review queues fill with tracks that aren't playable yet. This is deliberately tighter than S1R (>100/15m) so it gives lead time.
+
+**NOT a money incident.** Under prod auto-capture (`submission_manual_capture` OFF), money is captured at `confirmPayment` **before** transcode. A media backlog delays playability/review, not capture. Do not escalate to payments.
+
+**Triage / remediation:**
+1. Confirm it's a real backlog, not a scrape blip: `celery_queue_depth{queue="media"}` trend over 15m, and `celery-worker` health (`docker ps`, `/health`).
+2. Check whether one slow/stuck job is head-of-lining: worker logs for the `transcode[...]: TIMINGS` lines; a single wedged encode blocks the lane.
+3. If it's genuine load (launch/drop burst) and depth is still climbing: **arm the pre-staged C-class resize** (the launch burst valve). A bigger box is the intended lever, not shipping new infra under load; the C resize also relieves the 2-vCPU contention the single-box floor cannot. The specific resize target and steps are pre-staged and rehearsed ahead of launch — see the media-scale launch-readiness plan (task #8); until that lands, escalate to the operator rather than improvising a resize under load.
+4. Do NOT throw workers at it blindly on the 2-vCPU box: more media concurrency on a saturated box starves the live tier (hosts/audience). Prefer the resize.
+
+**Note:** The raw signals (`celery_queue_depth{queue="media"}`, and transcode duration via `celery_task_duration_seconds_total{...,queue="media"}` ÷ `celery_task_events_total`) already ship from app `/metrics`; this alert only adds the tuned, prod-inclusive threshold. Activation requires importing the rule via the Grafana-managed Alerting provisioning API (see `grafana/alerts/rules.yml` header).
+
+---
+
 #### Alert ATE1: Async Task Publish Errors
 
 **Severity:** P1 · **Trigger:** staging `task_publish_total{result="error"}` for 5+ min.
