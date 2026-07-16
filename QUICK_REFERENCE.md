@@ -1,6 +1,26 @@
 # Quick Reference - iowire.com
 
 **Emergency Access**: `ssh -i ~/code/tb_code/cert/standard-poc-key.pem ubuntu@standard.iowire.com`
+(that host is **PRODUCTION** — confirm with `dig +short standard.iowire.com` before
+running anything. EC2 Name tags are misleading; see
+`.claude-shared/rules/production-safety.md`.)
+
+> **This page is prod-framed but is NOT fully current — parts of it predate the
+> dedicated-RDS cutover.** Two standing corrections that apply to every block below:
+>
+> 1. **Prod's database is the RDS `<prod-db>`, not a container.** Any
+>    `docker exec ... psql` against a compose `db` container on prod queries an
+>    orphaned database prod does not read — including the read-only queries on
+>    this page. Treat their output as untrustworthy. See **Backup & Restore**.
+> 2. **Services named `standard`, `portal`, `metrics`, `admin` do not exist.**
+>    The real services are `caddy, app, app-next, celery-worker, celery-beat,
+>    pgbouncer, db, redis, tusd, livekit, discord-bot, livekit-ingress,
+>    livekit-egress, alloy`. Commands naming the first four are **no-ops** —
+>    they will not restart what you think they restarted.
+>
+> Known-stale blocks are tracked in `tasks/runbook-drift-2026-07-15.md` §4.
+> For anything load-bearing, prefer `OPERATIONAL_RUNBOOK.md` (alert-driven,
+> maintained) over this page.
 
 ---
 
@@ -30,7 +50,7 @@ curl http://localhost:8080/health
 | **App (external)** | `curl -s https://standard.iowire.com/health` | JSON |
 | **Database** | `docker exec <db-container> psql -U postgres -d standard_iowire -c "SELECT 1;"` | 1 row |
 | **Redis** | `docker exec <redis-container> redis-cli ping` | PONG |
-| **PgBouncer** | `docker exec standard-iowire-pgbouncer-1 sh -c 'echo "SHOW POOLS;" \| psql -p 6432 -U postgres pgbouncer'` | pool list |
+| **PgBouncer** | `docker exec <pgbouncer-container> sh -c 'echo "SHOW POOLS;" \| psql -p 6432 -U postgres pgbouncer'` | pool list |
 | **Prometheus** | `docker exec <app-container> python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:5000/metrics').read().decode()[:100])"` | metrics text |
 | **Uptime Monitor** | `tail -5 /var/log/uptime_monitor.log` | recent OK |
 | **Metrics JSONL** | `tail -1 /var/log/standard-metrics.jsonl \| python3 -m json.tool` | JSON entry |
@@ -83,31 +103,73 @@ docker-compose restart <service_name>
 ```
 
 ### Out of Disk Space
-```bash
-# Clean Docker
-docker system prune -a --volumes
 
-# Clean old backups
-find ~/postgres_backups -mtime +7 -delete
+> **NEVER run `docker system prune --volumes` (or `-a`) on prod.** `--volumes`
+> destroys every volume not attached to a *running* container — including
+> `caddy_data` (TLS certs), `postgres_data`, and `user_uploads` (**user audio**).
+> Any stopped service (a restart, a `down`, a prune during triage) makes its
+> volumes eligible. `-a` additionally deletes every unused image, forcing a
+> full rebuild on a box that builds the app from source.
+
+```bash
+# Reclaim safely: stopped containers + dangling images only. Never --volumes, never -a.
+docker container prune -f
+docker image prune -f
+
+# Rotate logs (usually the real consumer)
+sudo logrotate -f /etc/logrotate.conf
+
+# Clean old backups (canonical local path; S3 retention is bucket lifecycle)
+find /opt/<app>/backups -type f -mtime +7 -delete
 ```
+
+Full triage with per-consumer diagnosis: `OPERATIONAL_RUNBOOK.md` → Alert S3: Disk Space Low.
 
 ---
 
 ## 💾 Backup & Restore
 
-### Backup Now
+> **Prod's database is the dedicated RDS `<prod-db>`**, not a container.
+> The base compose file still defines a local `db` service, and the production
+> override repoints pgbouncer at the RDS. So **any `docker exec ... psql` /
+> `pg_dump` against a compose `db` container on prod talks to an orphaned
+> database that prod does not read.** It will appear to succeed and change
+> nothing. See `docker-compose.override.yml` (pgbouncer `DATABASE_URL`) and
+> `scripts/deploy_box.sh` (`DATA_TIER_SERVICES=""` on prod — "do NOT (re)start
+> the orphan local `db` container").
+
+### Snapshot before anything risky (verified, safe)
 ```bash
-~/backup_postgres.sh
+# Point-in-time RDS snapshot. This is the prod-correct pre-change safety net.
+AWS_PROFILE=standard aws rds create-db-snapshot \
+  --db-instance-identifier <prod-db> \
+  --db-snapshot-identifier pre-change-$(date +%Y%m%d-%H%M) --region us-east-1
 ```
+Source: `docs/deployment/ROLLBACK_RUNBOOK.md` → Pre-Deploy Checklist.
 
 ### Restore from Backup
-```bash
-# ⚠️ This overwrites current data!
-docker-compose stop standard portal metrics admin
-gunzip -c ~/postgres_backups/backup-YYYYMMDD-HHMMSS.sql.gz | \
-  docker exec -i <db-container> psql -U postgres standard_iowire
-docker-compose up -d
-```
+
+> ### ⛔ GAP — there is no verified prod restore procedure. Do not improvise one.
+>
+> The step-by-step restore that used to live here was **removed on 2026-07-15**:
+> it stopped four services that do not exist, restored into a container that is
+> not prod's database, and finished with a single-`-f` `up -d` that repoints
+> prod's pgbouncer away from the RDS. Every one of those is silent — the
+> operator sees success.
+>
+> **This repo does not contain a drilled RDS restore procedure**, and the
+> provenance of the daily dumps is **unverified**: `scripts/backup_db.sh` dumps
+> the compose `db` service (the orphan local container), not the RDS. Until that
+> is resolved, do **not** assume `s3://standard-iowire-backups/daily/` holds
+> prod data.
+>
+> **If you need to restore prod: STOP and escalate to Alex.** A prod restore is
+> an RDS operation (snapshot restore / PITR), it is sign-off gated, and it must
+> not be assembled from this page under incident pressure. Related:
+> `docs/deployment/ROLLBACK_RUNBOOK.md` (rollback ≠ restore).
+>
+> Restoring into a **local or staging** container is a different, documented
+> operation: `OPERATIONAL_RUNBOOK.md` → Recovery Procedures. Do not point it at prod.
 
 ---
 
@@ -130,36 +192,35 @@ Full process: `docs/deployment/RELEASE_PROCESS.md`.
 
 ## 👥 User Management
 
-### Create User (via psql)
-```bash
-docker exec -it <db-container> psql -U postgres -d standard_iowire << 'EOF'
-INSERT INTO users (email, password_hash, roles, created_at, updated_at)
-VALUES (
-  'user@example.com',
-  '$argon2id$...',  -- Use scripts/hash_password.py
-  '["user"]'::jsonb,
-  NOW(),
-  NOW()
-);
-EOF
-```
+> **Use the admin UI. Do not mutate users with `psql` on prod.**
+>
+> The hand-rolled `INSERT`/`UPDATE`/`DELETE` recipes that used to live here were
+> **removed on 2026-07-15**. They bypassed the audited admin path (no
+> `admin_action` row, no attribution — violates the standing "prod mutations use
+> the audited path" rule), and every one of them was also broken:
+> they targeted a `db` container that is not prod's database (see
+> **Backup & Restore** above), referenced a `users.roles` column that no longer
+> exists (ABAC bundles replaced it), called a `scripts/hash_password.py` that is
+> not in the repo, and wrote to a `user_sessions` table that exists only under
+> `.archive/`. A "successful" password reset here changes nothing on the account
+> the user is locked out of.
 
-### Reset Password
-```bash
-# Generate hash
-cd ~/code
-python3 scripts/hash_password.py "new_password"
+| Task | Audited path |
+|---|---|
+| Find / inspect a user | `/admin/users` → `boom-queue/routes/admin/users.py:86` (`admin_users`), detail at `:280` |
+| Change user fields | `/api/admin/users/<id>` `PUT` → `boom-queue/routes/admin/users.py:144` (`api_admin_update_user`) |
+| Password reset | Self-serve flow — `boom-queue/routes/auth.py:1255` (`forgot_password`) issues the token; `:1324` (`reset_password`) consumes it |
+| Unlock a locked-out user | `/admin/users/<id>/unlock` `POST` → `boom-queue/routes/admin/lockout.py:52` (`admin_unlock_user`) |
+| Change a subscription | `/admin/users/<id>/subscription` `POST` → `boom-queue/routes/admin/users.py:357` |
 
-# Update in database
-docker exec -it <db-container> psql -U postgres -d standard_iowire -c \
-  "UPDATE users SET password_hash = '<hash>' WHERE email = 'user@example.com';"
-```
+**Force-logout has no audited admin route today** (the old recipe targeted a dead
+table). If you need to invalidate a session on prod, escalate to Alex rather than
+improvising SQL.
 
-### Delete User Sessions (Force Logout)
-```bash
-docker exec -it <db-container> psql -U postgres -d standard_iowire -c \
-  "DELETE FROM user_sessions WHERE user_id = (SELECT id FROM users WHERE email = 'user@example.com');"
-```
+If break-glass SQL is genuinely unavoidable, it runs against the **RDS** (see
+**Backup & Restore** above for why, and `OPERATIONAL_RUNBOOK.md` →
+Database Access for the owner-role connection), with an explicit audit-log entry
+and sign-off. It is never a `docker exec` against a compose `db` container.
 
 ---
 

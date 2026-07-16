@@ -68,7 +68,7 @@ ssh -i ~/code/tb_code/cert/standard-poc-key.pem ubuntu@standard.iowire.com
 > visible to `ps`). The `( ... )` subshell scopes `PGPASSWORD` to the single
 > command — it does NOT leak into the parent shell or subsequent invocations.
 
-# Prod DB is the dedicated **RDS** `standard-prod-db` (no local `<db-container>`
+# Prod DB is the dedicated **RDS** `<prod-db>` (no local `<db-container>`
 # container). The app connects as the NON-ROTATING owner role `standard_iowire_owner`
 # through pgbouncer; use that role for app-consistent access, NOT the auto-rotating
 # `postgres` master. The RDS is reachable ONLY from the prod EC2 box (SG-scoped), so
@@ -76,7 +76,7 @@ ssh -i ~/code/tb_code/cert/standard-poc-key.pem ubuntu@standard.iowire.com
 
 ```bash
 # Easiest: reuse the app container's existing owner DATABASE_URL (through pgbouncer)
-docker compose -f docker-compose.yml -f docker-compose.production.yml \
+docker compose -f docker-compose.yml -f docker-compose.override.yml \
   exec app sh -lc 'psql "$DATABASE_URL"'
 
 # Direct to RDS as the owner role. PGPASSWORD lives only inside the subshell parens.
@@ -85,7 +85,7 @@ docker compose -f docker-compose.yml -f docker-compose.production.yml \
     --with-decryption \
     --query Parameter.Value \
     --output text) \
-  psql "postgresql://standard_iowire_owner@standard-prod-db.c09gyk8iqz13.us-east-1.rds.amazonaws.com:5432/standard_iowire?sslmode=require" )
+  psql "postgresql://standard_iowire_owner@<prod-db-endpoint>:5432/standard_iowire?sslmode=require" )
 ```
 
 **Service Logs** (`docker compose -f docker-compose.yml ...` from `/opt/<app>`):
@@ -356,7 +356,7 @@ monitoring spec's noise budget, no runbook = no alert.
 2. Confirm disk usage: `df -h /` — note `% used` per partition.
 3. Identify largest consumers: `sudo du -sh /var/log/* /var/lib/docker/* /opt/<app>/* 2>/dev/null | sort -h | tail -10`
 4. Apply the matching remediation:
-   - **Docker logs (most common):** `sudo docker system prune -f --volumes` (frees image+log layers).
+   - **Docker logs (most common):** `sudo docker container prune -f && sudo docker image prune -f` (frees stopped containers + unused image/log layers). **NEVER add `--volumes`** — it destroys every volume not attached to a *running* container, which under this alert means `caddy_data` (TLS certs), `postgres_data` and `user_uploads` (**user audio**) the moment anything is stopped (`docker-compose.yml` `volumes:` block). Same instinct as "NEVER `DROP DATABASE`" below. Never `-a` on prod either: the app image is built from source here, so `-a` forces a full rebuild.
    - **Postgres data growth:** check `SELECT pg_size_pretty(pg_database_size('iowire'));` against historical baseline. If >2× baseline, investigate orphan/temp tables. NEVER `DROP DATABASE`.
    - **App logs (`/var/log`):** rotate logs immediately: `sudo logrotate -f /etc/logrotate.conf`. Verify cron-driven rotation is wired (Sprint 107 B2 closed this gap; check `/etc/logrotate.d/standard-backup`).
    - **Loki WAL backup:** `docker compose -f /opt/<app>/docker-compose.yml logs alloy --tail=200` for stuck flushes.
@@ -377,7 +377,7 @@ monitoring spec's noise budget, no runbook = no alert.
 1. Cross-reference Sentry: <https://sentry.io/organizations/iowire/issues/?statsPeriod=15m&query=is%3Aunresolved> — group by exception type. The most common error in the last 15 min is the root cause candidate.
 2. Check container health: `docker compose -f /opt/<app>/docker-compose.yml ps` — any unhealthy/restarting? Recent OOM kill? `docker compose ... logs app --tail=200 | grep -iE "error|killed|oom"`.
 3. Check upstream dependencies in this order:
-   - **Database:** prod DB is dedicated RDS (`standard-prod-db`), reached through pgbouncer — reuse the app container's owner `DATABASE_URL` (see [Database Access](#access-information) above): `docker compose -f /opt/<app>/docker-compose.yml -f /opt/<app>/docker-compose.production.yml exec app sh -lc 'psql "$DATABASE_URL" -c "SELECT count(*) FROM pg_stat_activity;"'` (should be <80% of pool). Absolute `-f` paths so the command works from any directory post-SSH.
+   - **Database:** prod DB is dedicated RDS (`<prod-db>`), reached through pgbouncer — reuse the app container's owner `DATABASE_URL` (see [Database Access](#access-information) above): `docker compose -f /opt/<app>/docker-compose.yml -f /opt/<app>/docker-compose.override.yml exec app sh -lc 'psql "$DATABASE_URL" -c "SELECT count(*) FROM pg_stat_activity;"'` (should be <80% of pool). Absolute `-f` paths so the command works from any directory post-SSH.
    - **Redis:** `docker compose ... exec redis redis-cli INFO replication` and `INFO memory`.
    - **Stripe:** check Stripe Dashboard → Developers → Logs for elevated 4xx/5xx rate from their side.
 4. If a deploy landed in the last hour, consider rollback: `cd /opt/<app> && bash scripts/promote.sh rollback`.
@@ -564,7 +564,7 @@ monitoring spec's noise budget, no runbook = no alert.
 
 **Triage (in order):**
 
-1. Identify long-running queries — prod DB is dedicated RDS (`standard-prod-db`) reached through pgbouncer, so run psql from the app container with its owner `DATABASE_URL` (see [Database Access](#access-information)): `docker compose -f /opt/<app>/docker-compose.yml -f /opt/<app>/docker-compose.production.yml exec app sh -lc 'psql "$DATABASE_URL" -c "SELECT pid, age(clock_timestamp(), query_start) AS age, state, left(query, 100) AS query FROM pg_stat_activity WHERE state != \$\$idle\$\$ ORDER BY age DESC LIMIT 10;"'` (`$$idle$$` is Postgres dollar-quoting — avoids nested single-quote escaping)
+1. Identify long-running queries — prod DB is dedicated RDS (`<prod-db>`) reached through pgbouncer, so run psql from the app container with its owner `DATABASE_URL` (see [Database Access](#access-information)): `docker compose -f /opt/<app>/docker-compose.yml -f /opt/<app>/docker-compose.override.yml exec app sh -lc 'psql "$DATABASE_URL" -c "SELECT pid, age(clock_timestamp(), query_start) AS age, state, left(query, 100) AS query FROM pg_stat_activity WHERE state != \$\$idle\$\$ ORDER BY age DESC LIMIT 10;"'` (`$$idle$$` is Postgres dollar-quoting — avoids nested single-quote escaping)
 2. Identify long-running transactions (held connection blocking pool return): same query but filter `WHERE state IN ('idle in transaction', 'idle in transaction (aborted)')`. Anything older than 60s is suspicious.
 3. Kill a stuck query if confirmed safe to abort: `SELECT pg_cancel_backend(<pid>);`. Avoid `pg_terminate_backend` unless cancel fails.
 4. Check pgbouncer side: `docker compose ... exec pgbouncer psql -h localhost -p 6432 -U postgres pgbouncer -c "SHOW POOLS;" -c "SHOW CLIENTS;"`.
@@ -873,8 +873,10 @@ docker system df
 
 **Solution**:
 ```bash
-# Clean up Docker
-docker system prune -a --volumes
+# Clean up Docker — stopped containers + unused images only.
+# NEVER --volumes (destroys caddy_data/postgres_data/user_uploads) and never -a on prod.
+docker container prune -f
+docker image prune -f
 
 # Clean up old logs
 sudo find /var/log -type f -name "*.log" -mtime +30 -delete
@@ -954,6 +956,30 @@ export ALLOW_MISSING_SENTRY_DSN=true
 
 ## Backup & Recovery
 
+> ### ⚠️ Read before running anything in this section
+>
+> **The container-based commands below are NOT a production path.** Prod's
+> database is the dedicated RDS `<prod-db>` — see
+> [Database Access](#access-information) ("no local `<db-container>`
+> container"). The base compose file still defines a `db` service, so a
+> `docker compose ... exec -T db pg_dump` or a `docker exec ... pg_restore` on
+> the prod box **succeeds against an orphaned local database that prod does not
+> read** (`scripts/deploy_box.sh` pins `DATA_TIER_SERVICES=""` on prod precisely
+> so the deploy never restarts that orphan). Backing it up captures nothing;
+> restoring into it changes nothing. Both look like success.
+>
+> - **Prod restore: GAP.** There is no drilled RDS restore procedure in this
+>   repo. Do not assemble one here during an incident — **escalate to Alex.**
+> - **Prod backup provenance: UNVERIFIED.** `scripts/backup_db.sh` dumps the
+>   compose `db` service, not the RDS. Until that is settled, do not assume
+>   `s3://standard-iowire-backups/daily/` holds prod data. Tracked as the
+>   backup-targeting investigation (`tasks/runbook-drift-2026-07-15.md` §7 B1).
+> - **Prod pre-change safety net that IS verified:** the RDS snapshot in
+>   [`ROLLBACK_RUNBOOK.md`](../deployment/ROLLBACK_RUNBOOK.md) → Pre-Deploy Checklist.
+>
+> Everything below is valid for **staging / local / drill** use, where the
+> compose `db` container really is the database.
+
 ### Backup Procedures
 
 #### Daily Automated Backup
@@ -1020,7 +1046,12 @@ docker exec -i <db-container> pg_restore -Fc \
   --no-owner --no-acl --clean --if-exists \
   /tmp/restore.dump
 
-# 4. Restart services
+# 4. Restart services.
+#    Staging/local: the single base file below is correct.
+#    On a box with an override (prod: docker-compose.override.yml, staging:
+#    docker-compose.staging.yml) you MUST pass BOTH -f files on every compose
+#    call. A single -f drops the override and repoints pgbouncer at the local
+#    db container. deploy_box.sh refuses to deploy when it detects that state.
 docker compose -f docker-compose.yml up -d
 
 # 5. Verify
