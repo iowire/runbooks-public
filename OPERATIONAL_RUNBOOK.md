@@ -612,6 +612,42 @@ monitoring spec's noise budget, no runbook = no alert.
 
 ---
 
+#### Sentry: Stuck marketplace ServiceOrders (detect-only, no auto-remediation yet)
+
+**Severity:** P2 · **Trigger:** the Sentry message `STUCK_MARKETPLACE_ORDERS` fires (emitted hourly by the report-only sweeper `tasks/marketplace_order_backstop.py`, beat `:38`).
+
+**Why this matters:** marketplace `ServiceOrder`s that missed their normal state transition are sitting past grace, and **there is currently no automated retry** — `reconcile_orders()` (`routes/api_orders.py`), the reconciler that would recover them, is implemented + tested but **not wired to Beat** (tracked: PR #1339 ships this detector; wiring the money-moving retry is a separate, Alex-gated step). Until that lands, remediation is **manual**. The buckets differ in money-risk:
+- **`transferring`** — the order was charged and its status flipped, but the Stripe transfer to the provider never completed (common cause: provider Connect account inactive). **Buyer charged, provider unpaid, funds parked on the platform balance.** This is the genuinely stranded money; `stuck_value_cents` in the Sentry extras is its summed `amount_cents`.
+- **`pending`** — a PI exists but the `payment_intent.succeeded` webhook was likely missed; may or may not have captured. Verify against Stripe before assuming money moved.
+- **`held`** — funds are pre-release (escrow); nothing is stranded platform-side yet, but auto-release is overdue.
+
+Not a double-pay risk: `_execute_transfers` is `already_attempted`- + Stripe-`idempotency_key`-guarded, so a supervised retry cannot double-transfer.
+
+**Triage (in order):**
+
+1. Read the Sentry extras: `pending`, `transferring`, `held`, `total`, `stuck_value_cents`, `transferring_order_ids`. The `transferring` bucket + `stuck_value_cents` are the priority.
+2. Confirm the population against the DB (read-only; mirrors the sweeper's exact predicates). On prod (`<DB-EIP>`, `<app-container>`), owner role via pgbouncer:
+   ```sql
+   SELECT
+     count(*) FILTER (WHERE status='pending'      AND created_at <= now() - interval '2 hours'
+                          AND stripe_payment_intent_id IS NOT NULL)                    AS pending,
+     count(*) FILTER (WHERE status='transferring' AND updated_at <= now() - interval '30 minutes') AS transferring,
+     count(*) FILTER (WHERE status='held'         AND held_until <= now() - interval '1 hour'
+                          AND hold_paused_at IS NULL)                                  AS held,
+     coalesce(sum(amount_cents) FILTER (WHERE status='transferring'
+                          AND updated_at <= now() - interval '30 minutes'), 0)         AS transferring_value_cents
+   FROM service_orders;
+   ```
+3. For each `transferring_order_ids` entry, check Stripe: is `stripe_transfer_provider_id` set on the row? Is the provider's Connect account active (`stripe_charges_enabled`/`payouts_enabled`)? An inactive provider account is the usual root cause — the transfer will keep failing until the provider completes onboarding.
+
+**Remediation is money-moving → do NOT self-serve.** Completing a stuck `transferring` order (running the idempotency-keyed retry) moves funds to the provider. Route it through payments on-call / Alex — no `_execute_transfers` from an ad-hoc shell, no clawback, no auto-refund (`feedback_human_team_handles_refunds_telemetry_first`, `feedback_no_clawback_host_overcredit`). If the provider account is inactive, the fix is provider onboarding, then a supervised retry — not a refund unless the buyer requests one.
+
+**Escalate if:** `stuck_value_cents` is material, or `transferring`/`total` grows across consecutive hourly ticks (indicates an active failure mode, not a one-off) — page payments on-call and flag Alex. The durable fix is wiring `reconcile_orders` to Beat (Alex-gated); this signal exists to size and watch the exposure until then.
+
+**SLA:** Investigate within 4h (stranded, not lost). SOC 2 CC7.2.
+
+---
+
 #### Alert M1: Alloy Scrape Down
 
 **Severity:** P1 · **Trigger:** `absent_over_time(up{job="prometheus.scrape.flask"}[5m]) > 0` for 5+ min. `noDataState=OK` is intentional. PromQL semantics: `absent_over_time` returns an **empty vector** (→ NoData) when the input series HAS samples — i.e., during healthy Alloy operation. Flipping `noDataState=Alerting` would false-fire every evaluation cycle while Alloy is healthy. When samples ARE absent (Alloy down), the query returns `1` and the `> 0` threshold fires normally. See `<vault>/Lessons/grafana-cloud-mimir-ruler-grafana-am-wiring.md` §gotchas (vault is Obsidian-only on Alex/Tiffy laptops; no public URL).
