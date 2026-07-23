@@ -659,20 +659,19 @@ monitoring spec's noise budget, no runbook = no alert.
 
 #### Alert D4: Competition Entry Unresolved
 
-**Severity:** P2 · **Trigger:** a `competition_entry_no_bracket` marker OR a `competition_entry_unresolvable_pi` marker OR a `competition_entry_<cohort>_commit_FAILED` marker appears in prod app logs (Loki match count >0 over 10m).
+**Severity:** P2 · **Trigger:** a `competition_entry_no_bracket` marker OR a `competition_entry_<cohort>_commit_FAILED` marker appears in prod app logs (Loki match count >0 over 10m).
 
-**Why this matters:** a paid competition entry has no valid bracket in its PI metadata and is **parked for human backfill** (no entry, no refund — the money is captured-on-delivery and the pool row is still a valid review an operator can bracket); or a PI whose metadata claims a competition purchase **resolves to no Submission at all** (detect-only — nothing was safe to void or cancel, money stays where it is); or a refusal's local cancellation could not be committed. No money is lost yet, but the entry set is incomplete until an operator acts.
+**Why this matters:** a paid competition entry has no valid bracket in its PI metadata and is **parked for human backfill** (no entry, no refund — the money is captured-on-delivery and the pool row is still a valid review an operator can bracket); or a refusal's local cancellation could not be committed. No money is lost yet, but the entry set is incomplete until an operator acts.
 
 **Triage (in order):**
 
 1. For `no_bracket`: read `pi=`/`submission=`/`competition=`. Assign the correct bracket (the PI metadata was missing/invalid); the entry then mints on the next delivery. Nothing to refund.
-2. For `unresolvable_pi`: read `pi=`/`metadata_submission=`/`metadata_competition=`. The code deliberately took NO action (acting blind against unverified metadata risks canceling a healthy hold). Investigate in order: a stale metadata stamp on a non-competition PI, a soft/hard-deleted submission, or a retry that overwrote `stripe_payment_id` onto a different row. The `competition.entry_unresolvable_pi` audit row carries the same ids. Reconciler invariant-1 (live entry vs dead payment) is the durable money-net while you investigate.
-3. For `commit_FAILED`: the refusal decided correctly but the DB write did not persist — re-check the submission's state and the hold. If `voided=False` was logged, the hold may also still be live (see D2).
-4. Reconciler lenses backstop all three cases; confirm the residue clears on the next reconcile window.
+2. For `commit_FAILED`: the refusal decided correctly but the DB write did not persist — re-check the submission's state and the hold. If `voided=False` was logged, the hold may also still be live (see D2). This includes `competition_entry_unresolvable_pi_commit_FAILED` (the D6 audit row itself failing to persist), not the bare unresolvable-PI page itself — see cross-ref.
+3. Reconciler lenses backstop both cases; confirm the residue clears on the next reconcile window.
 
-**Escalate if:** `no_bracket` volume is high right after a competition opens (bracket metadata not being stamped at create-intent) — flag the organizer/config, not an individual refund. `unresolvable_pi` recurring for the same PI across webhook redeliveries is one incident, not many.
+**Escalate if:** `no_bracket` volume is high right after a competition opens (bracket metadata not being stamped at create-intent) — flag the organizer/config, not an individual refund.
 
-**Cross-ref:** F58-1 (audit run 58); `unresolvable_pi` added by F68-1 (audit run 68) after F62-1/#1404 introduced the detect-only marker. Deliberately does NOT cover `competition entry (authorise) failed` — that best-effort auth-door mint is re-minted by the succeeded backstop (and its unrecoverable failure is D3) — nor the healthy-path refusal narratives (`pi_mismatch`, `cancelled_reservation`, at-auth cohorts), whose failure modes carry the D2/D3/D4-matched suffixes.
+**Cross-ref:** F58-1 (audit run 58). Deliberately does NOT cover `competition entry (authorise) failed` — that best-effort auth-door mint is re-minted by the succeeded backstop (and its unrecoverable failure is D3) — nor the healthy-path refusal narratives (`pi_mismatch`, `cancelled_reservation`, at-auth cohorts), whose failure modes carry the D2/D3/D4-matched suffixes. **Bare `competition_entry_unresolvable_pi` → D6** (Competition Entry Unresolvable PI, P1, below), not this alert: F68-1/#1406 briefly folded it in here at the same time #1407 stood up D6 specifically for it, so F70-1 restored the split after one log line paged twice.
 
 ---
 
