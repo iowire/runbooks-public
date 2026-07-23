@@ -613,6 +613,90 @@ monitoring spec's noise budget, no runbook = no alert.
 
 ---
 
+#### Alert D2: Competition Entry Hold Void Failed
+
+**Severity:** P1 · **Trigger:** any `competition_entry_<cohort>_void_FAILED` marker (cohorts `cap` / `out_of_window` / `bracket_finalized` / `admin_withdraw`) appears in prod app logs (Loki match count >0 over 10m).
+
+**Why this matters:** a competition refusal or admin withdrawal tried to CANCEL an uncaptured $35 hold and Stripe rejected it, so the authorization is left **LIVE**. Nothing is captured yet, but the shared `('async_void', pi_id)` idempotency key means the pool/SLA sweepers only re-attempt AFTER Stripe's 24h idempotency window — "the sweepers will retry" is true only after 24h, not minutes.
+
+**The cohort in the marker names the caller — and the two families triage differently:**
+- `cap` / `out_of_window` / `bracket_finalized` — an **at-auth refusal** from the webhook auth door. **No entry was ever written**, and the caller cancels the pool `Submission` so no host can deliver against it.
+- `admin_withdraw` — the audited **admin withdraw tool** releasing the hold on an **EXISTING** entry. The submission is **NOT** cancelled and the entry is left **LIVE**; the admin got a 502 (the withdrawal did not complete). The entry and its held money both still exist.
+
+**Triage (in order):**
+
+1. Read the marker line: it carries `pi=<payment_intent_id>` and `submission=<id>`. The cohort in the marker name says which caller fired.
+2. Verify in Stripe: the PI should be `requires_capture` (hold live, not captured). If it has since expired or been canceled, no action needed — the sweeper or Stripe's own expiry already released it.
+3. If still `requires_capture`, release it by hand via the audited path (admin withdraw tool / operator PI cancel). **Do not** capture it.
+4. Confirm the row state matches the cohort:
+   - at-auth cohorts (`cap` / `out_of_window` / `bracket_finalized`): the pool `Submission` should be `cancelled` (the refusal cancels it regardless of void outcome, so no host can deliver against it) and no entry should exist.
+   - `admin_withdraw`: the submission is **NOT** cancelled and the entry is **still LIVE** — the withdrawal 502'd. Once the hold is releasable, **re-run the admin withdraw** (which voids the hold and voids the entry in one transaction) rather than expecting a cancelled row or a missing entry.
+
+**Escalate if:** the same PI re-fires across consecutive windows (sweeper is not clearing it) — the reconciler competition lens (`diff_competition_entry`) is the durable backstop; page payments on-call if it also fails to surface it.
+
+**Cross-ref:** F58-1/F58-2 + adv#2 (audit run 58). No auto-refund — nothing was captured.
+
+---
+
+#### Alert D3: Competition Entry Captured No Entry
+
+**Severity:** P1 · **Trigger:** a `competition_entry_<cohort>_POST_CAPTURE` marker OR the `competition entry (succeeded backstop) FAILED` marker appears in prod app logs (Loki match count >0 over 10m).
+
+**Why this matters:** a competition PI was **CAPTURED** ($35 taken) but no `CompetitionEntry` could be minted — an out-of-window / bracket-finalized / over-cap arrival that had already settled, or the `payment_intent.succeeded` backstop mint failing after capture. No void is possible on a captured charge and nothing downstream retries: the entrant has paid and has no entry. This is the highest-urgency competition money CRITICAL.
+
+**Triage (in order):**
+
+1. Read the marker: `pi=<payment_intent_id>` + `submission=<id>` (+ `competition=`/`bracket=` on the POST_CAPTURE variants).
+2. Verify in Stripe the charge is `succeeded` (captured). Confirm no `CompetitionEntry` exists for the submission.
+3. Remediate with the **audited admin withdraw/refund tool** (`POST /admin/submissions/<id>/refund` election). Do NOT self-serve a Stripe refund — route the money action through the audited path.
+4. If a bracket/window fix is the right remedy (e.g. un-finalize + backfill), coordinate with the organizer before refunding.
+
+**Escalate if:** multiple entrants captured-with-no-entry in one competition (indicates a systemic finalize/window misconfiguration, not a one-off) — page payments on-call and flag Alex.
+
+**Cross-ref:** F58-1 (audit run 58). The reconciler competition lens catches residue on the next window; this alert is what should page first.
+
+---
+
+#### Alert D4: Competition Entry Unresolved
+
+**Severity:** P2 · **Trigger:** a `competition_entry_no_bracket` marker OR a `competition_entry_<cohort>_commit_FAILED` marker appears in prod app logs (Loki match count >0 over 10m).
+
+**Why this matters:** either a paid competition entry has no valid bracket in its PI metadata and is **parked for human backfill** (no entry, no refund — the money is captured-on-delivery and the pool row is still a valid review an operator can bracket), or a refusal's local cancellation could not be committed. No money is lost yet, but the entry set is incomplete until an operator acts.
+
+**Triage (in order):**
+
+1. For `no_bracket`: read `pi=`/`submission=`/`competition=`. Assign the correct bracket (the PI metadata was missing/invalid); the entry then mints on the next delivery. Nothing to refund.
+2. For `commit_FAILED`: the refusal decided correctly but the DB write did not persist — re-check the submission's state and the hold. If `voided=False` was logged, the hold may also still be live (see D2).
+3. Reconciler lenses backstop both cases; confirm the residue clears on the next reconcile window.
+
+**Escalate if:** `no_bracket` volume is high right after a competition opens (bracket metadata not being stamped at create-intent) — flag the organizer/config, not an individual refund.
+
+**Cross-ref:** F58-1 (audit run 58). Deliberately does NOT cover `competition entry (authorise) failed` — that best-effort auth-door mint is re-minted by the succeeded backstop (and its unrecoverable failure is D3).
+
+---
+
+#### Alert D5: Competition Credit Booking Failed
+
+**Severity:** P1 · **Trigger:** a `competition credit: … NO credit rows written` or `competition credit: … NOT booked for PI …` marker appears in prod app logs (Loki match count >0 over 10m).
+
+**Why this matters:** the competition capture-on-delivery split writer (`routes/payments/competition_credit.py`) **CAPTURED** the $35 at delivery but could not book one or both of the two credit rows. Unlike D3 (money captured, no entry at all), here a real payee is owed and left unpaid — the money settled on the platform balance and nothing auto-refunds or retries the booking. Three causes, distinguishable from the marker text:
+- `references missing competition … NO credit rows written` — the `Competition` row is gone (hard-deleted after entries were captured). **Neither** reviewer nor organizer booked.
+- `refusing negative split … NO credit rows written` — the frozen split terms resolved to a negative share (economics misconfig). **Neither** payee booked.
+- `has no resolvable organizer … organizer share of … NOT booked` — the organizer account is deleted/unresolvable. The **reviewer IS paid**; only the organizer share is stranded.
+
+**Triage (in order):**
+
+1. Read the marker: it carries the `PI <payment_intent_id>` plus `submission=` / `competition=` / `organizer id` depending on the cause. Note which of the three fired.
+2. Confirm against the DB: which competition-credit `Transaction` rows exist for the PI (the `competition_credit_rows(pi)` helper, `type='submission'`), and whether the competition and organizer still exist. The gap is whichever payee has no row.
+3. Verify in Stripe the charge is `succeeded` (captured) — this alert only fires post-capture, so the money has already moved to the platform balance.
+4. Remediate by hand — a **HUMAN decides** (telemetry-first, NO auto-refund, NO clawback): either book the missing credit row(s) once the competition/organizer is restored or corrected, or refund the entrant via the audited admin refund tool (`POST /admin/submissions/<id>/refund`) if the entry cannot stand. Route every money move through payments on-call / Alex.
+
+**Escalate if:** multiple PIs hit the same cause in one competition (a systemic delete/misconfig, not a one-off) — page payments on-call and flag Alex.
+
+**Cross-ref:** F58 follow-up (adv review #1, audit run 58). The reconciler competition lens surfaces credit-row gaps as the durable backstop; this alert is what should page first.
+
+---
+
 #### Sentry: Stuck marketplace ServiceOrders (detect-only, no auto-remediation yet)
 
 **Severity:** P2 · **Trigger:** the Sentry message `STUCK_MARKETPLACE_ORDERS` fires (emitted hourly by the report-only sweeper `tasks/marketplace_order_backstop.py`, beat `:38`).
