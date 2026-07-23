@@ -697,6 +697,26 @@ monitoring spec's noise budget, no runbook = no alert.
 
 ---
 
+#### Alert D6: Competition Entry Unresolvable PI
+
+**Severity:** P1 · **Trigger:** a `competition_entry_unresolvable_pi pi=…` marker appears in prod app logs (Loki match count >0 over 10m).
+
+**Why this matters:** the competition entry-formation door (`ensure_competition_entry_from_pi`, `routes/competitions.py`) resolves a PI to a `Submission` via the `stripe_payment_id` stamp before it can do anything else — mint, refuse, or void. This alert fires when the PI's OWN metadata claims it IS a competition purchase (`competition_entry=='1'`, stamped by create-intent) but that lookup found **no Submission row at all**: a retry overwrote the stamp onto a different row, or the row was soft/hard-deleted. Every other competition-entry alert (D2-D5) assumes a Submission was found; this is the one case where it wasn't, so the money is invisible to all of them. **DETECT-ONLY** — nothing here was safe to void or cancel against a row that could not even be validated, so no void was attempted; any hold is untouched.
+
+**Triage (in order):**
+
+1. Read the marker: it carries the `pi=` (payment_intent_id) plus `metadata_submission=` / `metadata_competition=` — the submission/competition IDs the PI's own metadata claims, not a confirmed row.
+2. Look the PI up directly in Stripe (dashboard or `stripe.PaymentIntent.retrieve`) to see its actual state (still held / captured / canceled) and confirm the metadata submission/competition IDs.
+3. Search for the `metadata_submission` ID in the DB: if it exists but the PI's `stripe_payment_id` has moved on to something else, a later purchase likely overwrote the stamp (this is the reachable staging mechanism the F62-1 round-2/3 `pi_mismatch` cohort closes on the *other* side of the same race). If it doesn't exist, the row was soft/hard-deleted.
+4. Cross-check the reconciler competition lens's invariant-1 (a live `CompetitionEntry` vs. a dead payment) — it is the durable backstop for exactly this class of gap and may already show where the money actually landed.
+5. Remediate by hand once the real row is found: mint the entry via the admin backfill path if the purchase is legitimate and unresolved, or void/refund via the audited admin tool if it cannot stand. Route every money move through payments on-call / Alex.
+
+**Escalate if:** this fires repeatedly for the same competition or in a tight burst — suggests a systemic stamp-overwrite bug, not an isolated race.
+
+**Cross-ref:** F62-1 round 4 (Codex HIGH-2). Companion to the F62-1 `pi_mismatch` refusal cohort (`_refuse_mismatched_entry_pi`), which handles the case where the *new* row IS found; this alert covers the case where lookup finds nothing at all.
+
+---
+
 #### Sentry: Stuck marketplace ServiceOrders (detect-only, no auto-remediation yet)
 
 **Severity:** P2 · **Trigger:** the Sentry message `STUCK_MARKETPLACE_ORDERS` fires (emitted hourly by the report-only sweeper `tasks/marketplace_order_backstop.py`, beat `:38`).
